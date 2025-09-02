@@ -39,7 +39,7 @@ public class SessionManagerTests
             Mock.Of<IHostApplicationLifetime>());
 
         await Assert.ThrowsAsync(exceptionType, () => sessionManager.GetAuthorizationToken(
-            new User("test", "default", "default"),
+            new User("test", "default"),
             deviceId,
             "app_name",
             "0.0.0",
