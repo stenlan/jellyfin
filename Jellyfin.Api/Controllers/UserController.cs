@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Threading.Tasks;
+using ICU4N.Util;
 using Jellyfin.Api.Constants;
 using Jellyfin.Api.Extensions;
 using Jellyfin.Api.Helpers;
@@ -10,21 +11,25 @@ using Jellyfin.Api.Models.UserDtos;
 using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
+using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Authentication;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Devices;
+using MediaBrowser.Controller.Events;
+using MediaBrowser.Controller.Events.Authentication;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Net;
 using MediaBrowser.Controller.Playlists;
-using MediaBrowser.Controller.QuickConnect;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.QuickConnect;
 using MediaBrowser.Model.Users;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -38,47 +43,51 @@ namespace Jellyfin.Api.Controllers;
 public class UserController : BaseJellyfinApiController
 {
     private readonly IUserManager _userManager;
+    private readonly IUserAuthenticationManager _userAuthenticationManager;
     private readonly ISessionManager _sessionManager;
     private readonly INetworkManager _networkManager;
     private readonly IDeviceManager _deviceManager;
     private readonly IAuthorizationContext _authContext;
     private readonly IServerConfigurationManager _config;
     private readonly ILogger _logger;
-    private readonly IQuickConnect _quickConnectManager;
     private readonly IPlaylistManager _playlistManager;
+    private readonly IEventManager _eventManager;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="UserController"/> class.
     /// </summary>
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface.</param>
+    /// <param name="userAuthenticationManager">Instance of the <see cref="IUserAuthenticationManager"/> interface.</param>
     /// <param name="sessionManager">Instance of the <see cref="ISessionManager"/> interface.</param>
     /// <param name="networkManager">Instance of the <see cref="INetworkManager"/> interface.</param>
     /// <param name="deviceManager">Instance of the <see cref="IDeviceManager"/> interface.</param>
     /// <param name="authContext">Instance of the <see cref="IAuthorizationContext"/> interface.</param>
     /// <param name="config">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
-    /// <param name="quickConnectManager">Instance of the <see cref="IQuickConnect"/> interface.</param>
     /// <param name="playlistManager">Instance of the <see cref="IPlaylistManager"/> interface.</param>
+    /// <param name="eventManager">Instance of the <see cref="IEventManager"/> interface.</param>
     public UserController(
         IUserManager userManager,
+        IUserAuthenticationManager userAuthenticationManager,
         ISessionManager sessionManager,
         INetworkManager networkManager,
         IDeviceManager deviceManager,
         IAuthorizationContext authContext,
         IServerConfigurationManager config,
         ILogger<UserController> logger,
-        IQuickConnect quickConnectManager,
-        IPlaylistManager playlistManager)
+        IPlaylistManager playlistManager,
+        IEventManager eventManager)
     {
         _userManager = userManager;
+        _userAuthenticationManager = userAuthenticationManager;
         _sessionManager = sessionManager;
         _networkManager = networkManager;
         _deviceManager = deviceManager;
         _authContext = authContext;
         _config = config;
         _logger = logger;
-        _quickConnectManager = quickConnectManager;
         _playlistManager = playlistManager;
+        _eventManager = eventManager;
     }
 
     /// <summary>
@@ -174,14 +183,14 @@ public class UserController : BaseJellyfinApiController
     /// <response code="200">User authenticated.</response>
     /// <response code="403">Sha1-hashed password only is not allowed.</response>
     /// <response code="404">User not found.</response>
-    /// <returns>A <see cref="Task"/> containing an <see cref="AuthenticationResult"/>.</returns>
+    /// <returns>A <see cref="Task"/> containing an <see cref="Session"/>.</returns>
     [HttpPost("{userId}/Authenticate")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ApiExplorerSettings(IgnoreApi = true)]
     [Obsolete("Authenticate with username instead")]
-    public async Task<ActionResult<AuthenticationResult>> AuthenticateUser(
+    public async Task<ActionResult<Session>> AuthenticateUser(
         [FromRoute, Required] Guid userId,
         [FromQuery, Required] string pw)
     {
@@ -201,36 +210,70 @@ public class UserController : BaseJellyfinApiController
     }
 
     /// <summary>
-    /// Authenticates a user by name.
+    /// Authenticates a user by name and password.
     /// </summary>
     /// <param name="request">The <see cref="AuthenticateUserByName"/> request.</param>
     /// <response code="200">User authenticated.</response>
-    /// <returns>A <see cref="Task"/> containing an <see cref="AuthenticationRequest"/> with information about the new session.</returns>
+    /// <returns>A <see cref="Task"/> containing an <see cref="Session"/> with information about the new session.</returns>
     [HttpPost("AuthenticateByName")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<ActionResult<AuthenticationResult>> AuthenticateUserByName([FromBody, Required] AuthenticateUserByName request)
+    public async Task<ActionResult<Session>> AuthenticateUserByName([FromBody, Required] AuthenticateUserByName request)
     {
         var auth = await _authContext.GetAuthorizationInfo(Request).ConfigureAwait(false);
+        var remoteEndpoint = HttpContext.GetNormalizedRemoteIP().ToString();
+        if (string.IsNullOrWhiteSpace(request.Username))
+        {
+            _logger.LogInformation("Authentication request without username has been denied (IP: {IP}).", remoteEndpoint);
+            throw new ArgumentNullException("request.Username");
+        }
+
+        var mfaAwareClient = HttpContext.Request.Headers.ContainsKey("X-MFA-Aware");
 
         try
         {
-            var result = await _sessionManager.AuthenticateNewSession(new AuthenticationRequest
-            {
-                App = auth.Client,
-                AppVersion = auth.Version,
-                DeviceId = auth.DeviceId,
-                DeviceName = auth.Device,
-                Password = request.Pw,
-                RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString(),
-                Username = request.Username
-            }).ConfigureAwait(false);
+            var (provider, result) = await _userAuthenticationManager.Authenticate(new UsernamePasswordAuthData(request.Username, request.Pw, request.TOTP), remoteEndpoint).ConfigureAwait(false);
 
-            return result;
+            if (!result.Authenticated)
+            {
+                if (result.ErrorCode == 1300) // arbitrarily chosen error code used to signal that the username and password were correct, but TOTP was not
+                {
+                    throw new AuthenticationException("Incorrect or missing TOTP code.");
+                }
+
+                // MFA setup required. If client is MFA aware, send them the setup URI.
+                // If not, simply send an error message to avoid unnecessary leaking of secret, in case of
+                // clients that might display the raw error message on a screen, for example.
+                else if (result.ErrorCode == 1301)
+                {
+                    throw new AuthenticationException((mfaAwareClient && result.ErrorData != null) ? result.ErrorData : "MFA setup required.");
+                }
+
+                await _eventManager.PublishAsync(new AuthenticationRequestEventArgs(new AuthenticationRequest
+                {
+                    App = auth.Client,
+                    AppVersion = auth.Version,
+                    DeviceId = auth.DeviceId,
+                    DeviceName = auth.Device,
+                    Password = request.Pw,
+                    RemoteEndPoint = remoteEndpoint,
+                    Username = request.Username
+                })).ConfigureAwait(false);
+                throw new AuthenticationException("Invalid username or password entered.");
+            }
+
+            return await _sessionManager.CreateSession(
+                result.User,
+                auth.DeviceId,
+                auth.Client,
+                auth.Version,
+                auth.Device,
+                provider.GetType().FullName,
+                remoteEndpoint).ConfigureAwait(false);
         }
         catch (SecurityException e)
         {
             // rethrow adding IP address to message
-            throw new SecurityException($"[{HttpContext.GetNormalizedRemoteIP()}] {e.Message}", e);
+            throw new SecurityException($"[{remoteEndpoint}] {e.Message}", e);
         }
     }
 
@@ -243,16 +286,32 @@ public class UserController : BaseJellyfinApiController
     /// <returns>A <see cref="Task"/> containing an <see cref="AuthenticationRequest"/> with information about the new session.</returns>
     [HttpPost("AuthenticateWithQuickConnect")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public ActionResult<AuthenticationResult> AuthenticateWithQuickConnect([FromBody, Required] QuickConnectDto request)
+    public async Task<ActionResult<Session>> AuthenticateWithQuickConnect([FromBody, Required] QuickConnectDto request)
     {
+        var remoteEndpoint = HttpContext.GetNormalizedRemoteIP().ToString();
+
         try
         {
-            return _quickConnectManager.GetAuthorizedRequest(request.Secret);
+            var (provider, result) = await _userAuthenticationManager.Authenticate(new ExternallyTriggeredAuthenticationData(request.Secret), remoteEndpoint, "QuickConnect").ConfigureAwait(false);
+
+            if (provider is not IKeyedMonitorable<QuickConnectResult> monitorable)
+            {
+                return Unauthorized("Quick connect is disabled");
+            }
+
+            if (!result.Authenticated)
+            {
+                return Unauthorized("Unknown secret");
+            }
+
+            var auth = await _authContext.GetAuthorizationInfo(Request).ConfigureAwait(false);
+
+            return await _sessionManager.CreateSession(result.User, auth.DeviceId, auth.Client, auth.Version, auth.Device, provider.GetType().FullName, remoteEndpoint).ConfigureAwait(false);
         }
         catch (SecurityException e)
         {
             // rethrow adding IP address to message
-            throw new SecurityException($"[{HttpContext.GetNormalizedRemoteIP()}] {e.Message}", e);
+            throw new SecurityException($"[{remoteEndpoint}] {e.Message}", e);
         }
     }
 
@@ -286,30 +345,37 @@ public class UserController : BaseJellyfinApiController
             return StatusCode(StatusCodes.Status403Forbidden, "User is not allowed to update the password.");
         }
 
+        var passwordProvider = await _userAuthenticationManager.ResolveProvider<UsernamePasswordAuthData>().ConfigureAwait(false);
+
+        if (passwordProvider is not IPasswordChangeable passwordChangeable)
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, "You cannot change your password for this authentication provider.");
+        }
+
         if (request.ResetPassword)
         {
-            await _userManager.ResetPassword(user).ConfigureAwait(false);
+            await passwordChangeable.ResetPassword(user).ConfigureAwait(false);
         }
         else
         {
             if (!User.IsInRole(UserRoles.Administrator) || (userId.HasValue && User.GetUserId().Equals(userId.Value)))
             {
-                var success = await _userManager.AuthenticateUser(
-                    user.Username,
-                    request.CurrentPw ?? string.Empty,
-                    HttpContext.GetNormalizedRemoteIP().ToString(),
-                    false).ConfigureAwait(false);
+                var authenticationRes = await passwordProvider.Authenticate(new UsernamePasswordAuthData(user.Username, request.CurrentPw ?? string.Empty, request.TOTP)).ConfigureAwait(false);
 
-                if (success is null)
+                if (!authenticationRes.Authenticated)
                 {
+                    if (authenticationRes.ErrorCode == 1300) // arbitrarily chosen error code used to signal that the username and password were correct, but TOTP was not
+                    {
+                        return StatusCode(StatusCodes.Status403Forbidden, "A TOTP code is required.");
+                    }
+
                     return StatusCode(StatusCodes.Status403Forbidden, "Invalid user or password entered.");
                 }
             }
 
-            await _userManager.ChangePassword(user, request.NewPw ?? string.Empty).ConfigureAwait(false);
+            await passwordChangeable.ChangePassword(user, request.NewPw ?? string.Empty).ConfigureAwait(false);
 
             var currentToken = User.GetToken();
-
             await _sessionManager.RevokeUserTokens(user.Id, currentToken).ConfigureAwait(false);
         }
 
@@ -545,7 +611,15 @@ public class UserController : BaseJellyfinApiController
         // no need to authenticate password for new user
         if (request.Password is not null)
         {
-            await _userManager.ChangePassword(newUser, request.Password).ConfigureAwait(false);
+            var passwordProvider = await _userAuthenticationManager.ResolveProvider<UsernamePasswordAuthData>().ConfigureAwait(false);
+
+            if (passwordProvider is not IPasswordChangeable passwordChangeable)
+            {
+                await _userManager.DeleteUserAsync(newUser.Id).ConfigureAwait(false);
+                throw new InvalidOperationException("You cannot create a password for this authentication provider.");
+            }
+
+            await passwordChangeable.ChangePassword(newUser, request.Password).ConfigureAwait(false);
         }
 
         var result = _userManager.GetUserDto(newUser, HttpContext.GetNormalizedRemoteIP().ToString());
@@ -589,6 +663,41 @@ public class UserController : BaseJellyfinApiController
     {
         var result = await _userManager.RedeemPasswordResetPin(forgotPasswordPinRequest.Pin).ConfigureAwait(false);
         return result;
+    }
+
+    /// <summary>
+    /// Enables or disables MFA for a user.
+    /// </summary>
+    /// <param name="userId">The user id.</param>
+    /// <param name="request">The <see cref="SetUserMFADto"/> containing a boolean that indicates whether you want to disable or enable MFA for this user.</param>
+    /// <response code="200">Success.</response>
+    /// <response code="404">User not found.</response>
+    /// <returns>A <see cref="OkResult"/> indicating success, a <see cref="NotFoundResult"/> if the user was not found,
+    /// or a <see cref="BadRequestResult"/> if the default username/password authentication provider is not enabled and thus MFA
+    /// cannot be enabled.</returns>
+    [HttpPost("MFA/{userId}")]
+    [Authorize(Policy = Policies.RequiresElevation)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> SetMFA([FromRoute, Required] Guid userId, [FromBody, Required] SetUserMFADto request)
+    {
+        var user = _userManager.GetUserById(userId);
+        if (user is null)
+        {
+            return NotFound();
+        }
+
+        var defaultProvider = await _userAuthenticationManager.ResolveConcrete<DefaultAuthenticationProvider>().ConfigureAwait(false);
+
+        if (defaultProvider is null)
+        {
+            return BadRequest("Default authentication provider is not enabled.");
+        }
+
+        await defaultProvider.SetMFA(user, request.Enable).ConfigureAwait(false);
+
+        return Ok();
     }
 
     /// <summary>

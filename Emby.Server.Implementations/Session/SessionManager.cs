@@ -25,7 +25,6 @@ using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Events;
-using MediaBrowser.Controller.Events.Authentication;
 using MediaBrowser.Controller.Events.Session;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Net;
@@ -255,8 +254,16 @@ namespace Emby.Server.Implementations.Session
             ArgumentException.ThrowIfNullOrEmpty(appVersion);
             ArgumentException.ThrowIfNullOrEmpty(deviceId);
 
+            SessionInfo session = GetSessionInfo(appName, appVersion, deviceId, deviceName, remoteEndPoint, user);
+
+            await LogSessionActivity(session, user);
+
+            return session;
+        }
+
+        private async Task LogSessionActivity(SessionInfo session, User user)
+        {
             var activityDate = DateTime.UtcNow;
-            var session = GetSessionInfo(appName, appVersion, deviceId, deviceName, remoteEndPoint, user);
             var lastActivityDate = session.LastActivityDate;
             session.LastActivityDate = activityDate;
 
@@ -287,8 +294,6 @@ namespace Emby.Server.Implementations.Session
                         SessionInfo = session
                     });
             }
-
-            return session;
         }
 
         /// <inheritdoc />
@@ -386,7 +391,7 @@ namespace Emby.Server.Implementations.Session
         {
             if (session is null)
             {
-               return;
+                return;
             }
 
             if (string.IsNullOrEmpty(info.MediaSourceId))
@@ -509,7 +514,7 @@ namespace Emby.Server.Implementations.Session
             ArgumentException.ThrowIfNullOrEmpty(deviceId);
 
             var key = GetSessionKey(appName, deviceId);
-            SessionInfo newSession = CreateSessionInfo(key, appName, appVersion, deviceId, deviceName, remoteEndPoint, user);
+            SessionInfo newSession = CreateSessionInfo(key, appName, appVersion, deviceId, deviceName, remoteEndPoint, null, user);
             SessionInfo sessionInfo = _activeConnections.GetOrAdd(key, newSession);
             if (ReferenceEquals(newSession, sessionInfo))
             {
@@ -520,6 +525,7 @@ namespace Emby.Server.Implementations.Session
             sessionInfo.UserName = user?.Username;
             sessionInfo.UserPrimaryImageTag = user?.ProfileImage is null ? null : GetImageCacheTag(user);
             sessionInfo.RemoteEndPoint = remoteEndPoint;
+
             sessionInfo.Client = appName;
 
             if (!sessionInfo.HasCustomDeviceName || string.IsNullOrEmpty(sessionInfo.DeviceName))
@@ -537,6 +543,18 @@ namespace Emby.Server.Implementations.Session
             return sessionInfo;
         }
 
+        /// <summary>
+        /// Creates a new session info object.
+        /// </summary>
+        /// <param name="key">The session key.</param>
+        /// <param name="appName">Type of the client.</param>
+        /// <param name="appVersion">The app version.</param>
+        /// <param name="deviceId">The device id.</param>
+        /// <param name="deviceName">Name of the device.</param>
+        /// <param name="remoteEndPoint">The remote end point.</param>
+        /// <param name="authenticationProviderId">(optional) ID of the authentication provider used to authenticate this session.</param>
+        /// <param name="user">The user.</param>
+        /// <returns>The created <see cref="SessionInfo"/> object.</returns>
         private SessionInfo CreateSessionInfo(
             string key,
             string appName,
@@ -544,6 +562,7 @@ namespace Emby.Server.Implementations.Session
             string deviceId,
             string deviceName,
             string remoteEndPoint,
+            string authenticationProviderId,
             User user)
         {
             var sessionInfo = new SessionInfo(this, _logger)
@@ -561,6 +580,7 @@ namespace Emby.Server.Implementations.Session
             sessionInfo.UserName = username;
             sessionInfo.UserPrimaryImageTag = user?.ProfileImage is null ? null : GetImageCacheTag(user);
             sessionInfo.RemoteEndPoint = remoteEndPoint;
+            sessionInfo.AuthenticationProviderId = authenticationProviderId;
 
             if (string.IsNullOrEmpty(deviceName))
             {
@@ -1183,6 +1203,7 @@ namespace Emby.Server.Implementations.Session
                 AdditionalUsers = sessionInfo.AdditionalUsers,
                 Capabilities = _deviceManager.ToClientCapabilitiesDto(sessionInfo.Capabilities),
                 RemoteEndPoint = sessionInfo.RemoteEndPoint,
+                AuthenticationProviderId = sessionInfo.AuthenticationProviderId,
                 PlayableMediaTypes = sessionInfo.PlayableMediaTypes,
                 Id = sessionInfo.Id,
                 UserId = sessionInfo.UserId,
@@ -1561,60 +1582,20 @@ namespace Emby.Server.Implementations.Session
             }
         }
 
-        /// <summary>
-        /// Authenticates the new session.
-        /// </summary>
-        /// <param name="request">The authenticationrequest.</param>
-        /// <returns>The authentication result.</returns>
-        public Task<AuthenticationResult> AuthenticateNewSession(AuthenticationRequest request)
+        /// <inheritdoc/>
+        public async Task<MediaBrowser.Controller.Session.Session> CreateSession(User user, string deviceId, string appName, string appVersion, string deviceName, string authenticationProviderId, string remoteEndpoint)
         {
-            return AuthenticateNewSessionInternal(request, true);
-        }
+            ArgumentNullException.ThrowIfNull(user);
+            ArgumentException.ThrowIfNullOrEmpty(deviceId);
+            ArgumentException.ThrowIfNullOrEmpty(appName);
+            ArgumentException.ThrowIfNullOrEmpty(appVersion);
+            ArgumentException.ThrowIfNullOrEmpty(deviceName);
 
-        /// <summary>
-        /// Directly authenticates the session without enforcing password.
-        /// </summary>
-        /// <param name="request">The authentication request.</param>
-        /// <returns>The authentication result.</returns>
-        public Task<AuthenticationResult> AuthenticateDirect(AuthenticationRequest request)
-        {
-            return AuthenticateNewSessionInternal(request, false);
-        }
+            var key = GetSessionKey(appName, deviceId);
+            var session = CreateSessionInfo(key, appName, appVersion, deviceId, deviceName, remoteEndpoint, authenticationProviderId, user);
 
-        internal async Task<AuthenticationResult> AuthenticateNewSessionInternal(AuthenticationRequest request, bool enforcePassword)
-        {
-            CheckDisposed();
-
-            ArgumentException.ThrowIfNullOrEmpty(request.App);
-            ArgumentException.ThrowIfNullOrEmpty(request.DeviceId);
-            ArgumentException.ThrowIfNullOrEmpty(request.DeviceName);
-            ArgumentException.ThrowIfNullOrEmpty(request.AppVersion);
-
-            User user = null;
-            if (!request.UserId.IsEmpty())
-            {
-                user = _userManager.GetUserById(request.UserId);
-            }
-
-            user ??= _userManager.GetUserByName(request.Username);
-
-            if (enforcePassword)
-            {
-                user = await _userManager.AuthenticateUser(
-                    request.Username,
-                    request.Password,
-                    request.RemoteEndPoint,
-                    true).ConfigureAwait(false);
-            }
-
-            if (user is null)
-            {
-                await _eventManager.PublishAsync(new AuthenticationRequestEventArgs(request)).ConfigureAwait(false);
-                throw new AuthenticationException("Invalid username or password entered.");
-            }
-
-            if (!string.IsNullOrEmpty(request.DeviceId)
-                && !_deviceManager.CanAccessDevice(user, request.DeviceId))
+            if (!string.IsNullOrEmpty(deviceId)
+                && !_deviceManager.CanAccessDevice(user, deviceId))
             {
                 throw new SecurityException("User is not allowed access from this device.");
             }
@@ -1627,26 +1608,19 @@ namespace Emby.Server.Implementations.Session
                 throw new SecurityException("User is at their maximum number of sessions.");
             }
 
-            var token = await GetAuthorizationToken(user, request.DeviceId, request.App, request.AppVersion, request.DeviceName).ConfigureAwait(false);
+            var token = await GetAuthorizationToken(user, deviceId, appName, appVersion, deviceName).ConfigureAwait(false);
 
-            var session = await LogSessionActivity(
-                request.App,
-                request.AppVersion,
-                request.DeviceId,
-                request.DeviceName,
-                request.RemoteEndPoint,
-                user).ConfigureAwait(false);
+            await LogSessionActivity(session, user).ConfigureAwait(false);
 
-            var returnResult = new AuthenticationResult
+            var result = new MediaBrowser.Controller.Session.Session
             {
-                User = _userManager.GetUserDto(user, request.RemoteEndPoint),
+                User = _userManager.GetUserDto(user, remoteEndpoint),
                 SessionInfo = ToSessionInfoDto(session),
                 AccessToken = token,
                 ServerId = _appHost.SystemId
             };
 
-            await _eventManager.PublishAsync(new AuthenticationResultEventArgs(returnResult)).ConfigureAwait(false);
-            return returnResult;
+            return result;
         }
 
         internal async Task<string> GetAuthorizationToken(User user, string deviceId, string app, string appVersion, string deviceName)

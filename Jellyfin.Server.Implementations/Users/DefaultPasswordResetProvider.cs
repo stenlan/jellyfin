@@ -12,6 +12,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Users;
+using Microsoft.AspNetCore.Http;
 
 namespace Jellyfin.Server.Implementations.Users
 {
@@ -37,7 +38,6 @@ namespace Jellyfin.Server.Implementations.Users
             _passwordResetFileBaseDir = configurationManager.ApplicationPaths.ProgramDataPath;
             _passwordResetFileBase = Path.Combine(_passwordResetFileBaseDir, BaseResetFileName);
             _appHost = appHost;
-            // TODO: Remove the circular dependency on UserManager
         }
 
         /// <inheritdoc />
@@ -49,7 +49,12 @@ namespace Jellyfin.Server.Implementations.Users
         /// <inheritdoc />
         public async Task<PinRedeemResult> RedeemPasswordResetPin(string pin)
         {
+            // TODO: this function depends on userManager, while userManager also depends on this password reset provider.
+            // Similarly, this function depends on userAuthenticationManager which, as stated above, depends on this password reset provider.
+            // IMHO, the entire password reset flow should be revised and ideally moved into IUserAuthenticationManager, which is free to depend
+            // on userManager.
             var userManager = _appHost.Resolve<IUserManager>();
+            var userAuthenticationManager = _appHost.Resolve<IUserAuthenticationManager>();
             var usersReset = new List<string>();
             foreach (var resetFile in Directory.EnumerateFiles(_passwordResetFileBaseDir, $"{BaseResetFileName}*"))
             {
@@ -73,7 +78,14 @@ namespace Jellyfin.Server.Implementations.Users
                     var resetUser = userManager.GetUserByName(spr.UserName)
                         ?? throw new ResourceNotFoundException($"User with a username of {spr.UserName} not found");
 
-                    await userManager.ChangePassword(resetUser, pin).ConfigureAwait(false);
+                    var passwordProvider = await userAuthenticationManager.ResolveProvider<UsernamePasswordAuthData>().ConfigureAwait(false);
+
+                    if (passwordProvider is not IPasswordChangeable passwordChangeable)
+                    {
+                        throw new InvalidOperationException("You cannot change your password for this authentication provider.");
+                    }
+
+                    await passwordChangeable.ChangePassword(resetUser, pin).ConfigureAwait(false);
                     usersReset.Add(resetUser.Username);
                     File.Delete(resetFile);
                 }

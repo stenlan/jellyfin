@@ -44,6 +44,7 @@ using Jellyfin.Server.Implementations.FullSystemBackup;
 using Jellyfin.Server.Implementations.Item;
 using Jellyfin.Server.Implementations.MediaSegments;
 using Jellyfin.Server.Implementations.SystemBackupService;
+using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Events;
@@ -51,6 +52,7 @@ using MediaBrowser.Common.Net;
 using MediaBrowser.Common.Plugins;
 using MediaBrowser.Common.Updates;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Authentication;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Chapters;
 using MediaBrowser.Controller.ClientEvent;
@@ -71,7 +73,6 @@ using MediaBrowser.Controller.Net;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Controller.Playlists;
 using MediaBrowser.Controller.Providers;
-using MediaBrowser.Controller.QuickConnect;
 using MediaBrowser.Controller.Resolvers;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.Sorting;
@@ -123,7 +124,7 @@ namespace Emby.Server.Implementations
         private readonly IStartupOptions _startupOptions;
         private readonly PluginManager _pluginManager;
 
-        private List<Type> _creatingInstances;
+        private HashSet<Type> _creatingInstances;
 
         /// <summary>
         /// Gets or sets all concrete types.
@@ -301,7 +302,7 @@ namespace Emby.Server.Implementations
         /// <returns>System.Object.</returns>
         protected object CreateInstanceSafe(Type type)
         {
-            _creatingInstances ??= new List<Type>();
+            _creatingInstances ??= new HashSet<Type>();
 
             if (_creatingInstances.Contains(type))
             {
@@ -378,6 +379,56 @@ namespace Emby.Server.Implementations
             }
 
             return parts;
+        }
+
+        private IReadOnlyCollection<object> GetAuthenticationProviderExports()
+        {
+            var authenticationProviderType = typeof(IAuthenticationProvider<>);
+            var authenticationProviders = new List<object>();
+            foreach (var type in _allConcreteTypes)
+            {
+                var interfaces = type.FindInterfaces(
+                    (m, criteria) =>
+                    {
+                        if (m.IsGenericType && m.GetGenericTypeDefinition() == authenticationProviderType)
+                        {
+                            return true;
+                        }
+
+                        return false;
+                    },
+                    null);
+
+                if (interfaces.Length > 0) // implements generic IAuthenticationProvider
+                {
+                    var instance = CreateInstanceSafe(type);
+                    authenticationProviders.Add(instance);
+                    if (instance is IDisposable disposable)
+                    {
+                        _disposableParts.Add(disposable);
+                    }
+                }
+            }
+
+            var defaultAssembly = typeof(DefaultAuthenticationProvider).Assembly;
+
+            // Sort the authentication providers so that internal ones are first,
+            // which allows external ones to override internal ones.
+            // We don't sort others since plugin load order is non deterministic anyway.
+            authenticationProviders.Sort((a, b) =>
+            {
+                var aDefault = a.GetType().Assembly == defaultAssembly;
+                var bDefault = b.GetType().Assembly == defaultAssembly;
+
+                if (aDefault == bDefault) // both internal or both external
+                {
+                    return 0;
+                }
+
+                return aDefault ? -1 : 1;
+            });
+
+            return authenticationProviders;
         }
 
         /// <inheritdoc />
@@ -564,7 +615,6 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<IChapterManager, ChapterManager>();
 
             serviceCollection.AddSingleton<IAuthService, AuthService>();
-            serviceCollection.AddSingleton<IQuickConnect, QuickConnectManager>();
 
             serviceCollection.AddSingleton<ISubtitleParser, SubtitleEditParser>();
             serviceCollection.AddSingleton<ISubtitleEncoder, SubtitleEncoder>();
@@ -594,7 +644,7 @@ namespace Emby.Server.Implementations
 
             SetStaticProperties();
 
-            FindParts();
+            await FindParts().ConfigureAwait(false);
         }
 
         private X509Certificate2 GetCertificate(string path, string password)
@@ -661,7 +711,7 @@ namespace Emby.Server.Implementations
         /// <summary>
         /// Finds plugin components and register them with the appropriate services.
         /// </summary>
-        private void FindParts()
+        private async Task FindParts()
         {
             if (!ConfigurationManager.Configuration.IsPortAuthorized)
             {
@@ -687,6 +737,7 @@ namespace Emby.Server.Implementations
                 GetExports<IExternalUrlProvider>());
 
             Resolve<IMediaSourceManager>().AddParts(GetExports<IMediaSourceProvider>());
+            await Resolve<IUserAuthenticationManager>().RegisterProviders(GetAuthenticationProviderExports()).ConfigureAwait(false);
         }
 
         /// <summary>

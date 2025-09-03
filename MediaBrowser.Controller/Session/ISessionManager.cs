@@ -8,7 +8,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Entities.Security;
-using MediaBrowser.Controller.Authentication;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Session;
@@ -257,13 +256,17 @@ namespace MediaBrowser.Controller.Session
         void ReportNowViewingItem(string sessionId, string itemId);
 
         /// <summary>
-        /// Authenticates the new session.
+        /// Creates a new session for a given user.
         /// </summary>
-        /// <param name="request">The request.</param>
-        /// <returns>Task{SessionInfo}.</returns>
-        Task<AuthenticationResult> AuthenticateNewSession(AuthenticationRequest request);
-
-        Task<AuthenticationResult> AuthenticateDirect(AuthenticationRequest request);
+        /// <param name="user">The user.</param>
+        /// <param name="deviceId">The device id.</param>
+        /// <param name="appName">Type of the client.</param>
+        /// <param name="appVersion">The app version.</param>
+        /// <param name="deviceName">Name of the device.</param>
+        /// <param name="authenticationProviderId">The authentication provider used to authenticate this user.</param>
+        /// <param name="remoteEndpoint">The remote endpoint.</param>
+        /// <returns><see cref="Task"/>&lt;<see cref="global::MediaBrowser.Controller.Session.Session"/>&gt;.</returns>
+        Task<Session> CreateSession(User user, string deviceId, string appName, string appVersion, string deviceName, string authenticationProviderId, string remoteEndpoint);
 
         /// <summary>
         /// Reports the capabilities.

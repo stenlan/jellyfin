@@ -48,6 +48,16 @@ namespace Jellyfin.Database.Implementations.ModelConfiguration
                 .OnDelete(DeleteBehavior.Cascade);
 
             builder
+                .HasMany(u => u.AuthenticationProviderDatas)
+                .WithMany(d => d.Users)
+                .UsingEntity<UserAuthenticationProviderData>(
+                    r => r.HasOne<AuthenticationProviderData>().WithMany(d => d.UserAuthenticationProviderDatas).HasForeignKey("AuthenticationProviderId"),
+                    l => l.HasOne<User>().WithMany(d => d.UserAuthenticationProviderDatas).HasForeignKey("UserId"));
+
+            builder.Navigation(u => u.UserAuthenticationProviderDatas)
+                .AutoInclude();
+
+            builder
                 .HasIndex(entity => entity.Username)
                 .IsUnique();
         }
